@@ -1,0 +1,77 @@
+{
+  "schema_version": 1,
+  "app": "organizr",
+  "profile": "hale-homelab",
+  "notes": "Static manifest for the deterministic ./tester-env seed baseline (Organizr v2.1.5000, v2-master 6b27515f). Moves to apps/organizr/tester-env-seed.json when the app is forked. Seed is idempotent: each run restores the wizard rows, then inserts exactly these records.",
+  "credentials": {
+    "admin": "admin / OrganizrAdmin2026",
+    "seeded_users": "sarah | marcus | priya | guest with password HomelabUser2026",
+    "api_key": "organizrApiKey2026XX (header 'Token')"
+  },
+  "requirements": {
+    "admin-login": {
+      "status": "present",
+      "evidence": "Wizard admin admin/OrganizrAdmin2026 exists with fixed email admin@example.com and register_date 2026-01-05 09:00:00."
+    },
+    "users-multi-group": {
+      "status": "present",
+      "evidence": "5 users total: admin (Admin/0), sarah (Co-Admin/1, 2026-02-12 14:05:00), marcus (Power User/3, 2026-03-08 19:30:00), priya (User/4, 2026-04-19 08:15:00), guest (Guest/999, 2026-05-02 11:45:00), all with @example.com emails and fixed register dates."
+    },
+    "locked-user": {
+      "status": "present",
+      "evidence": "guest is locked (users.locked = 1); the other four users are unlocked."
+    },
+    "seed-user-login": {
+      "status": "present",
+      "evidence": "All seeded non-admin users share password HomelabUser2026 and can authenticate through POST /api/v2/login (verify asserts sarah)."
+    },
+    "tab-categories": {
+      "status": "present",
+      "evidence": "4 categories: Unsorted (order 1, category_id 0, default) plus Media (2/1), Downloads (3/2) and Infrastructure (4/3)."
+    },
+    "service-tabs": {
+      "status": "present",
+      "evidence": "9 seeded tabs after Settings and Homepage: Jellyfin (3/Media), Plex (4/Media), Sonarr (5/Downloads), Radarr (6/Downloads), qBittorrent (7/Downloads), Grafana (8/Infrastructure), Uptime Kuma (9/Infrastructure), Portainer (10/Infrastructure), Home Assistant (11/Infrastructure)."
+    },
+    "tab-group-gating": {
+      "status": "present",
+      "evidence": "Tab min group ids gate visibility: Jellyfin/Plex at User (4), Sonarr/Radarr/qBittorrent at Power User (3), Grafana/Uptime Kuma/Portainer/Home Assistant at Super User (2); admin sees all."
+    },
+    "disabled-tab": {
+      "status": "present",
+      "evidence": "Home Assistant is enabled=0: listed in Settings > Tab Editor but absent from the navigation sidebar."
+    },
+    "tab-order-sorting": {
+      "status": "present",
+      "evidence": "Tab order is 1 Settings, 2 Homepage, then 3-11 Jellyfin/Plex/Sonarr/Radarr/qBittorrent/Grafana/Uptime Kuma/Portainer/Home Assistant; categories order 1-4."
+    },
+    "default-landing-page": {
+      "status": "present",
+      "evidence": "Homepage tab is enabled and default=1, so a logged-in admin lands on the Homepage page."
+    },
+    "homepage-card": {
+      "status": "present",
+      "evidence": "Homepage Custom HTML 01 is enabled for Admin with the fixed card 'Hale Homelab' and the lines 'Jellyfin and Plex serve the media library' and 'Grafana, Uptime Kuma and Portainer watch the rack'; no external service is needed to render it."
+    },
+    "sidebar-navigation": {
+      "status": "present",
+      "evidence": "/api/v2/launch (what the SPA reads to build the sidebar) returns 10 enabled tabs for admin (Settings, Homepage, Jellyfin, Plex, Sonarr, Radarr, qBittorrent, Grafana, Uptime Kuma, Portainer) in 4 categories; the disabled Home Assistant tab is absent."
+    },
+    "tab-editor-listing": {
+      "status": "present",
+      "evidence": "Settings > Tab Editor > Tabs lists all 11 tabs (including the disabled Home Assistant) with name, category, min/max group and type."
+    },
+    "user-management-listing": {
+      "status": "present",
+      "evidence": "Settings > User Management > Users lists 5 users with email, group label and locked state."
+    },
+    "deterministic-reset": {
+      "status": "present",
+      "evidence": "./tester-env reset removes the container (config, SQLite DB, caches); deploy re-runs the wizard; seed restores the same canonical 5 users / 4 categories / 11 tabs / homepage card. Proven over two reset+deploy+seed cycles with identical snapshots."
+    },
+    "seed-idempotency": {
+      "status": "present",
+      "evidence": "Repeated ./tester-env seed runs and a drift tab added via the API converge to the same canonical snapshot; ./tester-env verify fails on an unseeded stack (expected 11 tabs, found 2)."
+    }
+  }
+}

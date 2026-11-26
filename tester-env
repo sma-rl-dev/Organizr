@@ -1,0 +1,624 @@
+#!/usr/bin/env bash
+# tester-env CLI for Organizr v2.1.5000
+# (v2-master @ 6b27515ff3bc6f4998ed83aca8c08be0998fd118; there is no tagged v2
+# release - upstream's latest Release is 1.90 from 2019, the v1 line).
+#
+# One editable-source container: PHP 8.5-FPM + nginx + SQLite (pdo_sqlite), built
+# from Dockerfile.tester-env. api/vendor is committed and no frontend build is
+# needed, so the build is a source copy plus nginx. The nginx config adds the
+# /api/v2 rewrite that upstream docker-organizr installs at runtime.
+#
+# First run is scripted through POST /api/v2/wizard with fixed values, which
+# writes data/config/config.php, the SQLite schema at data/organizr/organizr.db
+# and the first admin. `seed` then replaces the empty wizard shell with the fixed
+# Hale homelab baseline (5 users, 3 tab categories, 9 service tabs and a static
+# homepage card) through the same SQLite file and config.php. All state is inside
+# the container writable layer, so `reset` is a container removal and `deploy`
+# recreates the pristine image state.
+#
+# Ports/state:
+#   host port ${PORT:-53907} -> container 80
+#   No volumes. Credentials: admin / OrganizrAdmin2026, 20-char API key
+#   organizrApiKey2026XX (header `Token: ...`).
+#
+# Outbound server-side calls (news, update check, GitHub) are mapped to loopback
+# so they fail fast instead of hanging.
+#
+# All commands accept --run-id <id> and --port <port> because scripts/rl-env
+# invokes them that way. RUN_ID scopes containers only; IMAGE_TAG scopes the
+# image (content-addressed by rl-env, never run-id based).
+set -euo pipefail
+
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+
+RUN_ID="${RUN_ID:-default}"
+PORT="${PORT:-53907}"
+IMAGE_NAME="${IMAGE_TAG:-tester-env-organizr:dev}"
+DOCKERFILE="${SCRIPT_DIR}/Dockerfile.tester-env"
+
+CONTAINER_PORT=80
+
+ADMIN_USER="admin"
+ADMIN_PASS="OrganizrAdmin2026"
+ADMIN_EMAIL="admin@example.com"
+HASH_KEY="OrganizrHashKey2026"
+API_KEY="organizrApiKey2026XX"
+REGISTRATION_PASSWORD="RegisterPass2026"
+SEED_USER_PASSWORD="HomelabUser2026"
+DB_PATH="/var/www/organizr/data/organizr"
+DB_NAME="organizr.db"
+
+SUFFIX=""
+CONTAINER_NAME=""
+
+refresh_names() {
+  SUFFIX=""
+  [ "${RUN_ID}" != "default" ] && SUFFIX="-${RUN_ID}"
+  CONTAINER_NAME="tester-env-organizr${SUFFIX}"
+  LOCAL_URL="http://127.0.0.1:${PORT}"
+  LABELS=(
+    --label "tester-env.project=${TESTER_ENV_PROJECT:-tester-env}"
+    --label "tester-env.app=organizr"
+    --label "tester-env.scenario=${TESTER_ENV_SCENARIO:-manual}"
+    --label "tester-env.run_id=${TESTER_ENV_RUN_ID:-${RUN_ID}}"
+  )
+}
+
+log() { printf '==> %s\n' "$*"; }
+die() { printf '==> ERROR: %s\n' "$*" >&2; exit 1; }
+
+need_docker() {
+  command -v docker >/dev/null 2>&1 || die "docker is required"
+  command -v curl >/dev/null 2>&1 || die "curl is required"
+}
+
+container_exists() {
+  docker ps -a --filter "name=^/${CONTAINER_NAME}$" --format '{{.Names}}' | grep -qx "${CONTAINER_NAME}"
+}
+
+container_running() {
+  docker ps --filter "name=^/${CONTAINER_NAME}$" --format '{{.Names}}' | grep -qx "${CONTAINER_NAME}"
+}
+
+require_running() {
+  container_running || die "container ${CONTAINER_NAME} is not running; run './tester-env deploy' first"
+}
+
+body() { curl -sS --max-time 20 "$@" 2>/dev/null || true; }
+
+# Case-based substring test: avoids the pipefail/SIGPIPE trap of `printf | grep -q`.
+contains() {
+  case "$1" in *"$2"*) return 0 ;; *) return 1 ;; esac
+}
+
+http_code() { curl -sS -o /dev/null -w '%{http_code}' --max-time 20 "$@" 2>/dev/null || true; }
+
+wizard_installed() {
+  docker exec "${CONTAINER_NAME}" test -f /var/www/organizr/data/config/config.php >/dev/null 2>&1
+}
+
+wait_for_app() {
+  local deadline=$((SECONDS + 120))
+  log "waiting for Organizr on ${LOCAL_URL}"
+  while [ "${SECONDS}" -lt "${deadline}" ]; do
+    if [ "$(http_code "${LOCAL_URL}/")" = "200" ]; then
+      log "nginx answered on ${LOCAL_URL}"
+      return 0
+    fi
+    if ! container_running; then
+      docker logs --tail 60 "${CONTAINER_NAME}" 2>&1 || true
+      die "container ${CONTAINER_NAME} exited before it answered"
+    fi
+    sleep 1
+  done
+  docker logs --tail 80 "${CONTAINER_NAME}" 2>&1 || true
+  die "server did not answer within 120s"
+}
+
+run_wizard() {
+  local response
+  log "running the first-run wizard through POST /api/v2/wizard"
+  response=$(body -X POST -H 'Content-Type: application/json' \
+    --data "{\"license\":\"personal\",\"hashKey\":\"${HASH_KEY}\",\"api\":\"${API_KEY}\",\"registrationPassword\":\"${REGISTRATION_PASSWORD}\",\"username\":\"${ADMIN_USER}\",\"password\":\"${ADMIN_PASS}\",\"email\":\"${ADMIN_EMAIL}\",\"dbPath\":\"${DB_PATH}\",\"dbName\":\"${DB_NAME}\",\"driver\":\"sqlite3\"}" \
+    "${LOCAL_URL}/api/v2/wizard")
+  contains "${response}" '"result": "success"' \
+    || die "wizard rejected the fixed setup values: ${response}"
+  contains "${response}" '"data": true' \
+    || die "wizard did not report success: ${response}"
+  wizard_installed || die "wizard returned success but data/config/config.php is missing"
+  log "wizard created data/config/config.php and ${DB_PATH}/${DB_NAME}"
+}
+
+api_users() { body -H "Token: ${API_KEY}" "${LOCAL_URL}/api/v2/users"; }
+
+# /api/v2/launch returns Organizr::launch(): the same status the browser's
+# dependency page reads. status=ok needs config + all required extensions
+# (including zip) + a web root writable by www-data.
+assert_launch_status() {
+  local payload
+  payload=$(body -H "Token: ${API_KEY}" "${LOCAL_URL}/api/v2/launch")
+  contains "${payload}" '"status": "ok"' \
+    || die "launch status is not ok: ${payload}"
+  contains "${payload}" '"dependenciesInactive": []' \
+    || die "PHP dependencies are missing: ${payload}"
+  contains "${payload}" '"writable": "yes"' \
+    || die "the web root is not writable by the webserver user: ${payload}"
+  log "launch status ok: no missing PHP dependencies, web root writable"
+}
+
+cmd_deploy() {
+  need_docker
+  log "building image ${IMAGE_NAME} from ${DOCKERFILE}"
+  # No run-scoped labels on the image: IMAGE_TAG is content-addressed and must
+  # yield the same image ID for identical source across parallel runs.
+  docker build -t "${IMAGE_NAME}" -f "${DOCKERFILE}" "${SCRIPT_DIR}"
+
+  if container_exists; then
+    log "replacing existing container ${CONTAINER_NAME}"
+    docker stop --time 10 "${CONTAINER_NAME}" >/dev/null 2>&1 || true
+    docker rm "${CONTAINER_NAME}" >/dev/null
+  fi
+
+  log "starting ${CONTAINER_NAME} on port ${PORT}"
+  docker run -d --name "${CONTAINER_NAME}" "${LABELS[@]}" \
+    --add-host github.com:127.0.0.1 \
+    --add-host api.github.com:127.0.0.1 \
+    --add-host raw.githubusercontent.com:127.0.0.1 \
+    --add-host organizr.app:127.0.0.1 \
+    --add-host api.organizr.app:127.0.0.1 \
+    --add-host feature.organizr.app:127.0.0.1 \
+    -e TZ=UTC \
+    -p "${PORT}:${CONTAINER_PORT}" \
+    "${IMAGE_NAME}" >/dev/null
+
+  wait_for_app
+
+  if wizard_installed; then
+    log "existing container already has config; skipping the wizard"
+  else
+    run_wizard
+  fi
+
+  local users
+  users=$(api_users)
+  contains "${users}" "\"username\": \"${ADMIN_USER}\"" \
+    || die "API key ${API_KEY} cannot list users: ${users}"
+  log "API key accepted; ${ADMIN_USER} is present"
+
+  assert_launch_status
+
+  log "deployment complete: ${LOCAL_URL}/"
+  log "login: ${ADMIN_USER}/${ADMIN_PASS}"
+  log "next: ./tester-env seed && ./tester-env verify"
+}
+
+# Deterministic Hale homelab baseline. Idempotent: each run restores the wizard
+# rows (Settings + Homepage tabs, Unsorted category, admin user) and replaces
+# every other row with the fixed seed set, so reset+deploy+seed always converges
+# on the same 5 users / 4 categories / 11 tabs / one homepage card.
+cmd_seed() {
+  need_docker
+  require_running
+  wizard_installed || die "seed needs the wizard setup; run './tester-env deploy' first"
+  log "seeding the Hale homelab baseline (5 users, 3 categories, 9 service tabs, homepage card)"
+  docker exec -i -e SEED_USER_PASSWORD="${SEED_USER_PASSWORD}" "${CONTAINER_NAME}" php <<'PHP'
+<?php
+$dbPath = '/var/www/organizr/data/organizr/organizr.db';
+$configPath = '/var/www/organizr/data/config/config.php';
+$userPassword = getenv('SEED_USER_PASSWORD') ?: 'HomelabUser2026';
+
+function gravatar(string $email): string
+{
+	return 'https://www.gravatar.com/avatar/' . md5(strtolower(trim($email))) . '?s=100&d=mm';
+}
+
+$db = new PDO('sqlite:' . $dbPath, null, null, [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+$db->exec('PRAGMA busy_timeout = 5000');
+$db->beginTransaction();
+
+$db->exec("DELETE FROM tabs WHERE name NOT IN ('Settings', 'Homepage')");
+$db->exec("DELETE FROM categories WHERE category NOT IN ('Unsorted')");
+$db->exec("DELETE FROM users WHERE username != 'admin'");
+
+// Fixed dates; the Homepage tab becomes the post-login landing page.
+$db->prepare('UPDATE users SET register_date = ?, "group" = ?, group_id = ? WHERE username = ?')
+	->execute(['2026-01-05 09:00:00', 'Admin', 0, 'admin']);
+$db->exec("UPDATE tabs SET enabled = 1, \"default\" = 1, group_id = 4, group_id_max = 0, image = 'fontawesome::home' WHERE name = 'Homepage'");
+$db->exec("UPDATE tabs SET \"default\" = 0 WHERE name = 'Settings'");
+
+$insertCategory = $db->prepare('INSERT INTO categories (category, "order", category_id, image, "default") VALUES (?, ?, ?, ?, 0)');
+foreach ([
+	['Media', 2, 1, 'fontawesome::film'],
+	['Downloads', 3, 2, 'fontawesome::download'],
+	['Infrastructure', 4, 3, 'fontawesome::server'],
+] as $category) {
+	$insertCategory->execute($category);
+}
+
+// order, category_id, name, url, enabled, group_id, image
+$insertTab = $db->prepare('INSERT INTO tabs ("order", category_id, name, url, enabled, group_id, group_id_max, image, type, "default") VALUES (?, ?, ?, ?, ?, ?, 0, ?, 1, 0)');
+foreach ([
+	[3, 1, 'Jellyfin', 'http://jellyfin.lan:8096', 1, 4, 'fontawesome::film'],
+	[4, 1, 'Plex', 'http://plex.lan:32400/web', 1, 4, 'fontawesome::tv'],
+	[5, 2, 'Sonarr', 'http://sonarr.lan:8989', 1, 3, 'fontawesome::download'],
+	[6, 2, 'Radarr', 'http://radarr.lan:7878', 1, 3, 'fontawesome::film'],
+	[7, 2, 'qBittorrent', 'http://qbittorrent.lan:8080', 1, 3, 'fontawesome::cloud-download'],
+	[8, 3, 'Grafana', 'http://grafana.lan:3000', 1, 2, 'fontawesome::bar-chart'],
+	[9, 3, 'Uptime Kuma', 'http://uptime.lan:3001', 1, 2, 'fontawesome::heartbeat'],
+	[10, 3, 'Portainer', 'http://portainer.lan:9000', 1, 2, 'fontawesome::server'],
+	[11, 3, 'Home Assistant', 'http://homeassistant.lan:8123', 0, 2, 'fontawesome::home'],
+] as $tab) {
+	$insertTab->execute($tab);
+}
+
+// username, email, group, group_id, locked, register_date
+$insertUser = $db->prepare('INSERT INTO users (username, password, email, "group", group_id, locked, image, register_date, auth_service) VALUES (?, ?, ?, ?, ?, ?, ?, ?, \'internal\')');
+foreach ([
+	['sarah', 'sarah@example.com', 'Co-Admin', 1, 0, '2026-02-12 14:05:00'],
+	['marcus', 'marcus@example.com', 'Power User', 3, 0, '2026-03-08 19:30:00'],
+	['priya', 'priya@example.com', 'User', 4, 0, '2026-04-19 08:15:00'],
+	['guest', 'guest@example.com', 'Guest', 999, 1, '2026-05-02 11:45:00'],
+] as $user) {
+	$insertUser->execute([
+		$user[0],
+		password_hash($userPassword, PASSWORD_BCRYPT),
+		$user[1],
+		$user[2],
+		$user[3],
+		$user[4],
+		gravatar($user[1]),
+		$user[5],
+	]);
+}
+
+$counts = $db->query('SELECT (SELECT COUNT(*) FROM users) AS users, (SELECT COUNT(*) FROM tabs) AS tabs, (SELECT COUNT(*) FROM categories) AS categories')->fetch(PDO::FETCH_ASSOC);
+$db->commit();
+if ($counts['users'] != 5 || $counts['tabs'] != 11 || $counts['categories'] != 4) {
+	fwrite(STDERR, "seed self-check failed: " . json_encode($counts) . "\n");
+	exit(1);
+}
+
+// Homepage card: a static Custom HTML item, no external service required.
+$config = include $configPath;
+$config['homepageCustomHTML01Enabled'] = true;
+$config['homepageCustomHTML01Auth'] = '1';
+$config['customHTML01'] = '<div class="row"><div class="col-lg-12"><div class="white-box"><h3>Hale Homelab</h3><p>Media, downloads and monitoring for the Hale household.</p><ul><li>Jellyfin and Plex serve the media library</li><li>Sonarr and Radarr feed qBittorrent</li><li>Grafana, Uptime Kuma and Portainer watch the rack</li></ul></div></div></div>';
+ksort($config);
+if (file_put_contents($configPath, "<?php\nreturn " . var_export($config, true) . ";\n") === false) {
+	fwrite(STDERR, "seed failed to write {$configPath}\n");
+	exit(1);
+}
+
+printf("seeded %d users, %d tabs, %d categories and the Hale Homelab homepage card\n", $counts['users'], $counts['tabs'], $counts['categories']);
+PHP
+  log "seed complete: users admin/sarah/marcus/priya/guest, categories Media/Downloads/Infrastructure, tabs Jellyfin..Home Assistant"
+}
+
+# Seed assertions run against the same authenticated API the SPA uses.
+# $1 is the JSON body; exit 1 with a one-line reason on any mismatch.
+assert_seed_tabs() {
+  python3 - "$1" <<'PY'
+import json, sys
+
+def fail(message):
+    print("seed check failed: " + message, file=sys.stderr)
+    sys.exit(1)
+
+data = json.loads(sys.argv[1])["response"]["data"]
+tabs = {tab["name"]: tab for tab in data["tabs"]}
+categories = {category["category"]: category for category in data["categories"]}
+if len(data["tabs"]) != 11:
+    fail("expected 11 tabs, found %d" % len(data["tabs"]))
+if len(categories) != 4:
+    fail("expected 4 categories, found %d" % len(categories))
+for name, order, category_id in [("Unsorted", 1, 0), ("Media", 2, 1), ("Downloads", 3, 2), ("Infrastructure", 4, 3)]:
+    category = categories.get(name)
+    if category is None:
+        fail("category missing: " + name)
+    if int(category["order"]) != order or int(category["category_id"]) != category_id:
+        fail("category %s has order/category_id %s/%s" % (name, category["order"], category["category_id"]))
+expected = [
+    ("Settings", 1, 0, 1, 1, "api/v2/page/settings"),
+    ("Homepage", 2, 0, 1, 4, "api/v2/page/homepage"),
+    ("Jellyfin", 3, 1, 1, 4, "http://jellyfin.lan:8096"),
+    ("Plex", 4, 1, 1, 4, "http://plex.lan:32400/web"),
+    ("Sonarr", 5, 2, 1, 3, "http://sonarr.lan:8989"),
+    ("Radarr", 6, 2, 1, 3, "http://radarr.lan:7878"),
+    ("qBittorrent", 7, 2, 1, 3, "http://qbittorrent.lan:8080"),
+    ("Grafana", 8, 3, 1, 2, "http://grafana.lan:3000"),
+    ("Uptime Kuma", 9, 3, 1, 2, "http://uptime.lan:3001"),
+    ("Portainer", 10, 3, 1, 2, "http://portainer.lan:9000"),
+    ("Home Assistant", 11, 3, 0, 2, "http://homeassistant.lan:8123"),
+]
+for name, order, category_id, enabled, group_id, url in expected:
+    tab = tabs.get(name)
+    if tab is None:
+        fail("tab missing: " + name)
+    actual = (int(tab["order"]), int(tab["category_id"]), int(tab["enabled"]), int(tab["group_id"]), tab["url"])
+    if actual != (order, category_id, enabled, group_id, url):
+        fail("tab %s has order/category/enabled/group/url %s" % (name, actual))
+if int(tabs["Homepage"]["default"]) != 1:
+    fail("Homepage is not the default tab")
+print("    11 tabs, 4 categories, Homepage default, Home Assistant disabled")
+PY
+}
+
+assert_seed_users() {
+  python3 - "$1" <<'PY'
+import json, sys
+
+def fail(message):
+    print("seed check failed: " + message, file=sys.stderr)
+    sys.exit(1)
+
+users = {user["username"]: user for user in json.loads(sys.argv[1])["response"]["data"]}
+if len(users) != 5:
+    fail("expected 5 users, found %d" % len(users))
+expected = {
+    "admin": ("admin@example.com", "Admin", 0, 0, "2026-01-05 09:00:00"),
+    "sarah": ("sarah@example.com", "Co-Admin", 1, 0, "2026-02-12 14:05:00"),
+    "marcus": ("marcus@example.com", "Power User", 3, 0, "2026-03-08 19:30:00"),
+    "priya": ("priya@example.com", "User", 4, 0, "2026-04-19 08:15:00"),
+    "guest": ("guest@example.com", "Guest", 999, 1, "2026-05-02 11:45:00"),
+}
+for name, (email, group, group_id, locked, register_date) in expected.items():
+    user = users.get(name)
+    if user is None:
+        fail("user missing: " + name)
+    actual = (user["email"], user["group"], int(user["group_id"]), int(user["locked"] or 0), user["register_date"])
+    if actual != (email, group, group_id, locked, register_date):
+        fail("user %s has email/group/group_id/locked/date %s" % (name, actual))
+print("    5 users across Admin/Co-Admin/Power User/User/Guest, guest locked, fixed dates")
+PY
+}
+
+# /api/v2/launch is what the SPA reads to build the sidebar: enabled tabs
+# filtered by the current user's group plus all categories.
+assert_seed_navigation() {
+  python3 - "$1" <<'PY'
+import json, sys
+
+def fail(message):
+    print("seed check failed: " + message, file=sys.stderr)
+    sys.exit(1)
+
+data = json.loads(sys.argv[1])["response"]["data"]
+names = [tab["name"] for tab in data["tabs"]]
+expected = {"Settings", "Homepage", "Jellyfin", "Plex", "Sonarr", "Radarr", "qBittorrent", "Grafana", "Uptime Kuma", "Portainer"}
+if set(names) != expected or len(names) != len(expected):
+    fail("launch navigation tabs are %s" % sorted(names))
+if "Home Assistant" in names:
+    fail("disabled Home Assistant tab is visible in the navigation")
+if len(data["categories"]) != 4:
+    fail("expected 4 navigation categories, found %d" % len(data["categories"]))
+for tab in data["tabs"]:
+    if not tab.get("access_url"):
+        fail("tab %s has no access_url" % tab["name"])
+print("    10 visible navigation tabs (Home Assistant hidden) in 4 categories")
+PY
+}
+
+assert_seed_homepage() {
+  python3 - "$1" <<'PY'
+import json, sys
+
+def fail(message):
+    print("seed check failed: " + message, file=sys.stderr)
+    sys.exit(1)
+
+data = json.loads(sys.argv[1])["response"]["data"]
+for phrase in ("Hale Homelab", "Jellyfin and Plex serve the media library", "Grafana, Uptime Kuma and Portainer watch the rack"):
+    if phrase not in data:
+        fail("homepage page is missing %r" % phrase)
+print("    homepage renders the Hale Homelab custom HTML card")
+PY
+}
+
+cmd_verify() {
+  need_docker
+  require_running
+  local payload jar login html
+
+  log "checking the login page on ${LOCAL_URL}/"
+  [ "$(http_code "${LOCAL_URL}/")" = "200" ] || die "/ did not return 200"
+  html=$(body "${LOCAL_URL}/")
+  contains "${html}" 'Organizr' || die "the login page does not render Organizr"
+  if contains "${html}" 'DEPENDENCY CHECK' || contains "${html}" 'Dependencies Missing'; then
+    die "the root page reports a dependency failure instead of the login page"
+  fi
+
+  wizard_installed || die "setup wizard has not run (no data/config/config.php)"
+
+  assert_launch_status
+
+  log "checking the fixed API key"
+  payload=$(api_users)
+  contains "${payload}" "\"username\": \"${ADMIN_USER}\"" \
+    || die "the API key cannot list users: ${payload}"
+  contains "${payload}" '"email": "'"${ADMIN_EMAIL}"'"' \
+    || die "the wizard admin email is missing from /api/v2/users: ${payload}"
+  log "API key lists the ${ADMIN_USER} account"
+
+  log "checking username/password login"
+  jar=$(mktemp)
+  login=$(body -c "${jar}" -X POST -H 'Content-Type: application/json' \
+    --data "{\"username\":\"${ADMIN_USER}\",\"password\":\"${ADMIN_PASS}\",\"remember\":1}" \
+    "${LOCAL_URL}/api/v2/login")
+  contains "${login}" '"result": "success"' \
+    || die "login as ${ADMIN_USER} failed: ${login}"
+  payload=$(body -b "${jar}" "${LOCAL_URL}/api/v2/users")
+  contains "${payload}" "\"username\": \"${ADMIN_USER}\"" \
+    || die "the login cookie cannot list users: ${payload}"
+  log "login succeeded and the session cookie is authorized"
+
+  log "checking the seeded homelab data"
+  command -v python3 >/dev/null 2>&1 || die "python3 is required for the seed checks"
+  assert_seed_tabs "$(body -b "${jar}" "${LOCAL_URL}/api/v2/tabs")" \
+    || die "tab/category seed is missing or drifted; run './tester-env seed'"
+  assert_seed_users "$(body -b "${jar}" "${LOCAL_URL}/api/v2/users")" \
+    || die "user seed is missing or drifted; run './tester-env seed'"
+  assert_seed_navigation "$(body -b "${jar}" "${LOCAL_URL}/api/v2/launch")" \
+    || die "navigation seed is missing or drifted; run './tester-env seed'"
+  assert_seed_homepage "$(body -b "${jar}" "${LOCAL_URL}/api/v2/page/homepage")" \
+    || die "homepage seed is missing or drifted; run './tester-env seed'"
+  rm -f "${jar}"
+
+  log "checking a seeded non-admin login"
+  payload=$(body -X POST -H 'Content-Type: application/json' \
+    --data "{\"username\":\"sarah\",\"password\":\"${SEED_USER_PASSWORD}\",\"remember\":0}" \
+    "${LOCAL_URL}/api/v2/login")
+  contains "${payload}" '"result": "success"' \
+    || die "seeded user sarah cannot log in: ${payload}"
+  log "seeded user sarah logs in with ${SEED_USER_PASSWORD}"
+
+  log "checking the SQLite database is writable and persisted"
+  docker exec "${CONTAINER_NAME}" test -s "${DB_PATH}/${DB_NAME}" \
+    || die "SQLite database ${DB_PATH}/${DB_NAME} is missing"
+  log "verify passed: login page, wizard config, SQLite DB, API key, credentials and seeded homelab data"
+}
+
+cmd_reset() {
+  need_docker
+  log "resetting environment"
+  if container_exists; then
+    docker stop --time 10 "${CONTAINER_NAME}" >/dev/null 2>&1 || true
+    docker rm "${CONTAINER_NAME}" >/dev/null
+  fi
+  log "reset complete (container and its config/DB/caches removed; image kept for reuse)"
+}
+
+cmd_stop() {
+  need_docker
+  if container_running; then
+    docker stop --time 10 "${CONTAINER_NAME}" >/dev/null
+    log "stopped ${CONTAINER_NAME} (state preserved in the container filesystem)"
+  else
+    log "container ${CONTAINER_NAME} is not running"
+  fi
+}
+
+cmd_logs() {
+  need_docker
+  local tail_lines="${TAIL:-200}"
+  local follow=""
+  for arg in "$@"; do
+    case "${arg}" in
+      --follow|-f) follow="-f" ;;
+      *) tail_lines="${arg}" ;;
+    esac
+  done
+  docker logs --tail "${tail_lines}" ${follow} "${CONTAINER_NAME}" 2>&1 || die "no logs for ${CONTAINER_NAME}"
+}
+
+cmd_status() {
+  echo "App: Organizr v2.1.5000 (v2-master @ 6b27515f)"
+  echo "Image: ${IMAGE_NAME}"
+  echo "Port: ${PORT} (container ${CONTAINER_PORT})"
+  echo "URL: ${LOCAL_URL}/"
+  echo "Container: ${CONTAINER_NAME}"
+  echo "Volumes: none (config, SQLite DB and caches live in the container filesystem)"
+  if container_running; then
+    echo "Status: RUNNING"
+    echo "Credentials: ${ADMIN_USER}/${ADMIN_PASS}; seeded users sarah|marcus|priya|guest with ${SEED_USER_PASSWORD}"
+    echo "API key: ${API_KEY} (header 'Token')"
+  elif container_exists; then
+    echo "Status: STOPPED"
+  else
+    echo "Status: NOT RUNNING"
+  fi
+}
+
+cmd_help() {
+  cat <<EOF
+Organizr - Tester Environment CLI
+
+Usage: ./tester-env <command> [--run-id <id>] [--port <port>]
+
+Commands:
+  deploy    Build the source image (PHP 8.5-FPM + nginx + SQLite), start the
+            container and run the first-run wizard with fixed values
+            (${ADMIN_USER}/${ADMIN_PASS}, API key ${API_KEY})
+  seed      Replace the wizard shell with the deterministic Hale homelab
+            baseline: 5 users, Media/Downloads/Infrastructure categories, 9
+            service tabs and the Hale Homelab homepage card. Idempotent.
+  verify    Assert the login page, wizard config, SQLite DB, API key and the
+            username/password login, plus the seeded users/tabs/categories and
+            the homepage card
+  reset     Stop and remove the container (state is its writable layer: config,
+            SQLite DB, caches); the image is kept for reuse
+  stop      Stop the container (state preserved); 'down' is an alias
+  logs      Show container logs (TAIL=<n>, --follow)
+  status    Show container/image/URL/credential state
+  help      Show this help
+
+Options:
+  --run-id <id>   Scope the container name for parallel runs. Default: default
+  --port <port>   Host port bound to container ${CONTAINER_PORT}. Default: ${PORT}
+
+Environment:
+  IMAGE_TAG       Content-addressed image tag exported by scripts/rl-env
+                  (default: tester-env-organizr:dev)
+  RUN_ID          Run id; scopes the container, never the image name
+  PORT            Host port (same as --port)
+
+Notes:
+  - No database service and no volumes: SQLite at ${DB_PATH}/${DB_NAME}, config at
+    data/config/config.php and image caches at data/cache/, all in the container.
+  - The wizard is scripted with fixed values, so there is no random first-run
+    password. Seeded credentials: admin/${ADMIN_PASS} and
+    sarah|marcus|priya|guest with password ${SEED_USER_PASSWORD}.
+  - nginx adds upstream's required 'location /api/v2 { try_files \$uri
+    /api/v2/index.php\$is_args\$args; }'.
+  - Server-side GitHub/news/update hosts are mapped to loopback with --add-host
+    so they fail fast instead of hanging.
+EOF
+}
+
+main() {
+  local cmd="${1:-help}"
+  shift || true
+
+  local passthrough=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --run-id)
+        [ $# -ge 2 ] || die "--run-id requires a value"
+        RUN_ID="$2"
+        shift 2
+        ;;
+      --port)
+        [ $# -ge 2 ] || die "--port requires a value"
+        PORT="$2"
+        shift 2
+        ;;
+      --help|-h)
+        cmd_help
+        exit 0
+        ;;
+      *)
+        passthrough+=("$1")
+        shift
+        ;;
+    esac
+  done
+
+  refresh_names
+
+  case "${cmd}" in
+    deploy) cmd_deploy ;;
+    seed) cmd_seed ;;
+    verify) cmd_verify ;;
+    reset) cmd_reset ;;
+    stop|down) cmd_stop ;;
+    logs) cmd_logs "${passthrough[@]+"${passthrough[@]}"}" ;;
+    status) cmd_status ;;
+    help|--help|-h) cmd_help ;;
+    *)
+      printf '==> ERROR: unknown command %s\n' "${cmd}" >&2
+      cmd_help
+      exit 1
+      ;;
+  esac
+}
+
+main "$@"

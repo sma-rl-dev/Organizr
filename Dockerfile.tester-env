@@ -1,0 +1,36 @@
+# syntax=docker/dockerfile:1
+# Source build of Organizr v2 (PHP 8.5, nginx + php-fpm, SQLite) in one container.
+# api/vendor is committed and there is no frontend build, so this only installs
+# nginx plus the PHP extensions already present in the official php image
+# (pdo_sqlite, sqlite3, curl, dom, mbstring, session, json, xml, tokenizer).
+FROM php:8.5-fpm-alpine
+
+# Organizr's dependency page requires the zip extension and a web root writable
+# by the webserver user; php:8.5-fpm-alpine ships without zip and WORKDIR creates
+# /var/www/organizr owned by root. display_errors stays off because the committed
+# tightenco/collect triggers PHP 8.5 deprecation notices that would otherwise be
+# echoed into API JSON and break cookies/pages before headers are sent.
+RUN apk add --no-cache nginx \
+ && apk add --no-cache --virtual .build-deps $PHPIZE_DEPS libzip-dev \
+ && docker-php-ext-install zip \
+ && apk del .build-deps \
+ && apk add --no-cache libzip \
+ && rm -f /etc/nginx/http.d/default.conf \
+ && printf 'memory_limit = 512M\ndisplay_errors = Off\nlog_errors = On\nerror_reporting = E_ALL & ~E_DEPRECATED\n' > /usr/local/etc/php/conf.d/zz-organizr.ini
+
+COPY tester-env.nginx.conf /etc/nginx/nginx.conf
+COPY tester-env-entrypoint.sh /usr/local/bin/organizr-entrypoint
+RUN chmod 0755 /usr/local/bin/organizr-entrypoint
+
+WORKDIR /var/www/organizr
+COPY --chown=www-data:www-data . .
+
+# App-owned state written at runtime: data/config/config.php, the SQLite file
+# under data/organizr/ and image caches under data/cache/. All of it stays in the
+# container writable layer, so reset is a container removal.
+RUN mkdir -p data/config data/cache data/organizr \
+ && chown -R www-data:www-data data tmp \
+ && chown www-data:www-data /var/www/organizr
+
+EXPOSE 80
+ENTRYPOINT ["/usr/local/bin/organizr-entrypoint"]
